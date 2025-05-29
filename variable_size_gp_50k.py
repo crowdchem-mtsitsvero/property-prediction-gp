@@ -29,23 +29,27 @@ if torch.cuda.is_available():
 
 class SharedFeatureExtractor(nn.Module):
     """
-    Shared 2-layer neural network for deep kernel learning.
+    Shared neural network for deep kernel learning.
     All GPs will use this same feature extractor.
     """
     
-    def __init__(self, input_dim=1, hidden_dim=64, output_dim=32):
+    def __init__(self, input_dim: int = 1, hidden_dims: List[int] = [64], output_dim: int = 32):
         super().__init__()
         self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         
-        # 2-layer neural network
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
-            nn.ReLU()  # Optional: can be removed for more flexibility
-        )
+        layers = []
+        current_dim = input_dim
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(current_dim, h_dim))
+            layers.append(nn.ReLU())
+            current_dim = h_dim
+        
+        # Last layer to output_dim
+        layers.append(nn.Linear(current_dim, output_dim))
+        layers.append(nn.ReLU())  # Optional: can be removed for more flexibility
+        
+        self.network = nn.Sequential(*layers)
         
         # Initialize weights properly
         self._initialize_weights()
@@ -86,7 +90,7 @@ class DeepKernelVariableSizeBatchGPModel(gpytorch.models.ExactGP):
         # Deep kernel: RBF kernel operating on neural network features
         self.covar_module = gpytorch.kernels.ScaleKernel(
             gpytorch.kernels.RBFKernel(
-                ard_num_dims=shared_feature_extractor.output_dim,  # Use NN output dimension
+                ard_num_dims=1, #shared_feature_extractor.output_dim,  # Use NN output dimension
                 batch_shape=batch_shape
             ),
             batch_shape=batch_shape
@@ -433,8 +437,8 @@ def main():
     target_memory_gb = 6.0
     
     # Neural network configuration
-    nn_hidden_dim = 64
-    nn_output_dim = 32
+    nn_hidden_dims = [1000, 800, 200]  # New: Deeper network, approx. 969k parameters
+    nn_output_dim = 32  # Final output dimension of the feature extractor
     
     training_iterations_by_size = {
         1: 15,   # Tasks with 1 point need fewer iterations
@@ -453,13 +457,13 @@ def main():
     print(f"  Total tasks: {total_num_tasks:,}")
     print(f"  Training points per task: {min_train_points}-{max_train_points}")
     print(f"  Target memory usage: {target_memory_gb} GB")
-    print(f"  Neural network: 1 -> {nn_hidden_dim} -> {nn_output_dim}")
+    print(f"  Neural network: 1 -> {' -> '.join(map(str, nn_hidden_dims))} -> {nn_output_dim}")
     
     # Create shared feature extractor
     print(f"\nInitializing shared feature extractor...")
     shared_feature_extractor = SharedFeatureExtractor(
         input_dim=1, 
-        hidden_dim=nn_hidden_dim, 
+        hidden_dims=nn_hidden_dims, 
         output_dim=nn_output_dim
     ).to(device)
     
@@ -737,7 +741,15 @@ def main():
     avg_loss = np.mean([s['final_loss'] for s in training_stats])
     
     # Calculate total parameters
-    gp_params = sum(sum(p.numel() for p in model.parameters()) for models in trained_models_by_size.values() for model in models)
+    current_gp_params = 0
+    for num_points_key in trained_models_by_size: # num_points_key is, e.g., 1, 2, ... , 10
+        models_for_size = trained_models_by_size[num_points_key]
+        likelihoods_for_size = trained_likelihoods_by_size[num_points_key]
+        for model, likelihood in zip(models_for_size, likelihoods_for_size):
+            current_gp_params += sum(p.numel() for p in model.parameters()) # Parameters from the GP model structure
+            current_gp_params += sum(p.numel() for p in likelihood.parameters()) # Parameters from the likelihood
+    
+    gp_params = current_gp_params
     nn_params = sum(p.numel() for p in shared_feature_extractor.parameters())
     total_params = gp_params + nn_params
     
@@ -759,7 +771,7 @@ def main():
         'shared_feature_extractor_state_dict': shared_feature_extractor.state_dict(),
         'shared_feature_extractor_config': {
             'input_dim': 1,
-            'hidden_dim': nn_hidden_dim,
+            'hidden_dims': nn_hidden_dims,
             'output_dim': nn_output_dim
         },
         'task_assignments': task_assignments,
